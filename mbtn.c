@@ -18,6 +18,7 @@
 #include <sys/file.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -393,6 +394,14 @@ static int load_config(const char *path, struct config *config)
         return -1;
     }
 
+    /* The commands in the config run through 'sh -c' as this user */
+    struct stat config_stat;
+    if (fstat(fileno(file), &config_stat) == 0 &&
+        (config_stat.st_mode & (S_IWGRP | S_IWOTH)))
+        fprintf(stderr,
+                "Warning: %s is writable by group/others; its commands run as your user\n",
+                path);
+
     memset(config, 0, sizeof(*config));
     char line[MAX_CONFIG_LINE];
     unsigned int line_number = 0;
@@ -401,6 +410,17 @@ static int load_config(const char *path, struct config *config)
 
     while (fgets(line, sizeof(line), file)) {
         line_number++;
+
+        /* fgets() truncated the line: the rest would be parsed as a new line */
+        size_t raw_length = strlen(line);
+        if (raw_length > 0 && raw_length == sizeof(line) - 1 &&
+            line[raw_length - 1] != '\n' && !feof(file)) {
+            fprintf(stderr, "Config %s: line %u is longer than %d characters\n", path,
+                    line_number, MAX_CONFIG_LINE - 1);
+            result = -1;
+            break;
+        }
+
         char *entry = trim(line);
         if (!*entry || *entry == '#')
             continue;
@@ -414,24 +434,24 @@ static int load_config(const char *path, struct config *config)
         char *name = trim(entry);
         char *value = trim(equals + 1);
 
-        if (strcmp(name, "device_name") == 0) {
+        if (strcasecmp(name, "device_name") == 0) {
             if (!*value || strlen(value) >= sizeof(config->device_name)) {
                 result = -1;
                 break;
             }
             strcpy(config->device_name, value);
             have_device_name = 1;
-        } else if (strcmp(name, "wheel_delay") == 0) {
+        } else if (strcasecmp(name, "wheel_delay") == 0) {
             if (parse_delay(value, &config->wheel_delay_ms) < 0) {
                 result = -1;
                 break;
             }
-        } else if (strcmp(name, "scroll_delay") == 0) {
+        } else if (strcasecmp(name, "scroll_delay") == 0) {
             if (parse_delay(value, &config->scroll_delay_ms) < 0) {
                 result = -1;
                 break;
             }
-        } else if (strcmp(name, "swallow") == 0) {
+        } else if (strcasecmp(name, "swallow") == 0) {
             if (parse_swallow(config, value) < 0) {
                 result = -1;
                 break;
@@ -462,10 +482,11 @@ static int load_config(const char *path, struct config *config)
         if (binding->block && binding->type == TRIG_TAP &&
             !(config->swallow & (1ULL << binding->button_index))) {
             char buffer[32];
+            const char *label = button_label(BUTTON_BASE + binding->button_index, buffer,
+                                             sizeof(buffer));
             fprintf(stderr,
                     "Config %s: '!%s_TAP' requires %s in the 'swallow' directive\n", path,
-                    button_label(BUTTON_BASE + binding->button_index, buffer, sizeof(buffer)),
-                    buffer);
+                    label, label);
             return -1;
         }
     }
@@ -1169,7 +1190,8 @@ static int is_safe_rule_value(const char *text)
     for (; *text; text++) {
         unsigned char c = (unsigned char)*text;
         if (c < 0x20 || c == 0x7f || c == '"' || c == '\\' || c == '*' ||
-            c == '?' || c == '[' || c == ']' || c == '|')
+            c == '?' || c == '[' || c == ']' || c == '|' ||
+            c == '%' || c == '$')
             return 0;
     }
     return 1;
@@ -1438,6 +1460,9 @@ static int access_command(int argc, char **argv)
         return 1;
     }
 
+    /* Do not trust the caller's PATH for helper programs run as root */
+    setenv("PATH", "/usr/sbin:/usr/bin:/sbin:/bin", 1);
+
     if (!user)
         user = getenv("SUDO_USER");
     if (!user || !*user) {
@@ -1696,6 +1721,12 @@ static void spawn_command(const char *command)
     if (pid == 0) {
         setsid();
         signal(SIGCHLD, SIG_DFL);
+        int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd >= 0) {
+            dup2(null_fd, STDIN_FILENO);
+            if (null_fd > STDIN_FILENO)
+                close(null_fd);
+        }
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);
     }
@@ -1985,9 +2016,15 @@ static int stop_previous_instances(void)
     }
     self_executable[self_length] = '\0';
 
-    char lock_path[64];
-    snprintf(lock_path, sizeof(lock_path), "/tmp/mbtn-startup-%lu.lock",
-             (unsigned long)getuid());
+    char lock_path[PATH_MAX];
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    int lock_length = (runtime_dir && runtime_dir[0] == '/')
+                          ? snprintf(lock_path, sizeof(lock_path), "%s/mbtn-startup.lock",
+                                     runtime_dir)
+                          : -1;
+    if (lock_length < 0 || (size_t)lock_length >= sizeof(lock_path))
+        snprintf(lock_path, sizeof(lock_path), "/tmp/mbtn-startup-%lu.lock",
+                 (unsigned long)getuid());
     int lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (lock_fd < 0) {
         perror("Cannot open startup lock");
@@ -2191,6 +2228,14 @@ int main(int argc, char **argv)
             size_t count = (size_t)n / sizeof(struct input_event);
             for (size_t i = 0; i < count; i++)
                 handle_event(&config, &state, &sink, &events[i]);
+
+            if (sink.write_failed) {
+                /* Never keep the real mouse grabbed while the virtual one is broken */
+                fprintf(stderr, "Virtual device failed; releasing the mouse and retrying\n");
+                close_input(&fd, &sink);
+                reset_state(&state);
+                next_open_at = now_ms() + RECONNECT_DELAY_MS;
+            }
             continue;
         }
 
